@@ -6,7 +6,7 @@
 ;; URL: https://github.com/lorniu/go-translate
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience
-;; Version: 3.0.5
+;; Version: 3.1.0
 
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -71,6 +71,7 @@
 (require 'gt-engine-chatgpt)
 (require 'gt-engine-echo)
 (require 'gt-text-utility)
+(require 'gt-chat-openai)
 
 ;; Compat old version
 (ignore-errors
