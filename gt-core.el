@@ -1946,7 +1946,8 @@ Output to minibuffer by default."
     (gt-reset translator)
     ;; take
     (unless keep (setf text nil bounds nil target nil))
-    (setf taker (or (gt-ensure-plain _taker) (user-error "No taker found in this translator")))
+    (setf taker (or (gt-ensure-plain _taker)
+                    (user-error "No taker found in this translator")))
     (gt-take taker translator)
     (setf keep nil)
     (let ((history-delete-duplicates t))
