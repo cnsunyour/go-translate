@@ -15,7 +15,7 @@ This is a translation framework on Emacs, with high configurability and extensib
 [[README-zh.org][点击查看《中文版文档》]]
 
 As a translation framework, it offers many advantages:
-- Supports multiple translation engines, including ChatGPT, Bing, Google, DeepL, YoudaoDict, StarDict and more.
+- Supports multiple translation engines, including ChatGPT, Bing, Google, DeepL, YoudaoDict, StarDict, LibreTranslate and more.
 - Rich rendering components, such as rendering to Buffer, Posframe, Overlay, Kill Ring, and others. With stream output support.
 - Flexible retrieval of content and language for translation, with the help of the built-in Taker component.
 - Support for word and sentence translation, as well as translation of multiple paragraphs. It can use multiple engines concurrently to translate multiple paragraphs into multiple languages.
@@ -192,8 +192,12 @@ Finally, the initial text is cut and filtered based on =pick= and =pick-pred=. T
   ;; More complex and intelligent pick logic can be implemented
   (defun my-get-words-length>-6 (text)
     (cl-remove-if-not (lambda (bd) (> (- (cdr bd) (car bd)) 6))
-                      (gt-pick-items-from-text text 'word)))
+                      (gt-pick-items-by-thing text 'word)))
   (gt-translator :taker (gt-taker :text 'paragraph :pick #'my-get-words-length>-6))
+
+  ;; Use ':pick 'fresh-word' to pick unknown word only for translation
+  ;; With commands 'gt-record-words-as-known/unknown' to add word to known/unknown list
+  (gt-translator :taker (gt-taker :text 'paragraph :pick 'fresh-word))
 #+end_src
 
 *** component =gt-engine= for translating/transforming
@@ -215,6 +219,7 @@ The built-in Engine implementations are:
 - =gt-azure-openai-engine=, translate with Azure OpenAI
 - =gt-youdao-dict-engine/gt-youdao-suggest-engine=, 有道翻译，有道近义词
 - =gt-stardict-engine=, StarDict，for offline translate
+- =gt-libre-engine=, LibreTranslate, support both online and offline translate
 
 Specify engines for translator via =:engines=. A translator can have one or more engines, or you can specify a function that returns the engines:
 #+begin_src emacs-lisp
