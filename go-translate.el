@@ -6,7 +6,7 @@
 ;; URL: https://github.com/lorniu/go-translate
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience
-;; Version: 3.0.6
+;; Version: 3.0.8
 
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -74,11 +74,6 @@
 (require 'gt-engine-echo)
 (require 'gt-text-utility)
 
-;; Compat old version
-(ignore-errors
-  (add-to-list 'load-path (expand-file-name "v2" (file-name-directory (or load-file-name (buffer-file-name)))))
-  (require 'go-translate-v2))
-
 ;;; Mask these commands in M-x
 (dolist (cmd '(gt-prompt-next-target
                gt-buffer-render--cycle-next
@@ -93,7 +88,7 @@
                gt-posframe-render-auto-close-handler
                gt-stardict-switch-dict
                gt-overlay-render-save-to-kill-ring))
-  (put cmd 'completion-predicate (lambda (&rest _) nil)))
+  (put cmd 'completion-predicate #'ignore))
 
 
 ;;; Presets
@@ -237,12 +232,12 @@ will be used as the default translator."
       (list (desc1 taker (if (consp taker) (format "%s" taker)
                            (cl-flet ((desc2 (slot) (when (slot-boundp taker slot)
                                                      (format "%s: %s" slot (slot-value taker slot)))))
-                             (format "<%s> %s" (eieio-object-class taker)
+                             (format "<%s> %s" (gt-desc taker)
                                      (string-join (remove nil (mapcar #'desc2 '(langs text pick prompt))) ", ")))))
             (desc1 engines (mapconcat (lambda (en) (concat (format "%s" (oref en tag)) (if (gt-stream-p en) " (stream)")))
                                       (ensure-list (gt-ensure-plain engines)) ", "))
             (desc1 render (if (consp render) (format "%s" render)
-                            (format "<%s>" (eieio-object-class (gt-ensure-plain render)))))))))
+                            (gt-desc (gt-ensure-plain render))))))))
 
 (defun gt-set-taker (&optional translator taker)
   "Set TRANSLATOR's TAKER to one from `gt-preset-takers'."
