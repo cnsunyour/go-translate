@@ -545,16 +545,6 @@ That is: 1) define the translator 2) executable `gt-start'.")
   `(list ,@(cl-loop for slot in slots
                     collect `(slot-value ,instance ',slot))))
 
-(defun gt-format-params (data)
-  "Format DATA to k=v style query string.
-DATA should be list of (key . value)."
-  (if (or (null data) (stringp data)) data
-    (mapconcat (lambda (arg)
-                 (format "%s=%s"
-                         (url-hexify-string (format "%s" (car arg)))
-                         (url-hexify-string (format "%s" (or (cdr arg) 1)))))
-               (delq nil data) "&")))
-
 (defun gt-ensure-plain (obj &rest args)
   "Ensure OBJ is non-function and non-symbol.
 If OBJ is a function, call it with ARGS and return the result.
@@ -1008,33 +998,32 @@ If ONLY-EXPIRED not nil, purge caches expired only.")
 
 (require 'gt-httpx)
 
+(defvar plz-curl-program)
+
 (defvar gt-default-http-client
   (if (and (require 'plz nil t) (executable-find plz-curl-program))
       (gt-plz-http-client)
     (gt-url-http-client)))
 
-(cl-defmethod gt-request (&key url filter done fail data headers cache retry)
-  (ignore retry)
+(cl-defmethod gt-request (&rest args &key url method headers data filter done fail sync retry cache)
+  "Simple wrapper for http client, and add cache support."
+  (ignore method headers filter sync retry)
   (let ((client (gt-ensure-plain gt-default-http-client (url-host (url-generic-parse-url url)))))
     (if (and client (eieio-object-p client) (object-of-class-p client 'gt-http-client))
-        (let* ((tag (gt-desc client))
-               (data (gt-format-params data))
-               (ckey (sha1 (format "%s%s" url data)))
+        (let* ((ckey (sha1 (format "%s%s" url data)))
                (donefn (when done
                          (lambda (raw)
-                           (when cache ; cache the result for url if :cache exist
+                           ;; try to cache the result
+                           (when cache
                              (let ((gt-cache-alive-time (if (numberp cache) cache gt-cache-alive-time)))
                                (gt-cache-set gt-default-cacher ckey raw)))
-                           (condition-case err
-                               (funcall done raw)
-                             (error
-                              (gt-log tag (format "Request SUCCESS but FAIL in callback: (%s) %s" url err))
-                              (funcall fail err)))))))
+                           (funcall done raw)))))
+          ;; try to get from cache first
           (if-let (r (and cache (gt-cache-get gt-default-cacher ckey)))
-              (progn
-                (gt-log 'cacher (format "Find %s in cache..." ckey))
-                (funcall donefn r))
-            (gt-request client :url url :headers headers :data data :filter filter :done donefn :fail fail)))
+              (progn (gt-log 'cacher (format "Find %s in cache..." ckey))
+                     (if donefn (funcall donefn r) r))
+            (cl-remf args :cache)
+            (apply #'gt-request client `(:done ,donefn ,@args))))
       (let ((errmsg "Make sure `gt-default-http-client' is available. eg:\n\n(setq gt-default-http-client (gt-url-http-client))\n\n\n"))
         (if fail (funcall fail errmsg) (user-error errmsg))))))
 

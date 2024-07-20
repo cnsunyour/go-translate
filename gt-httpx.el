@@ -23,22 +23,44 @@
 
 ;;; Commentary:
 
-;; Http client components used by the framework.
+;; Http client components used by the framework. With unified interface to
+;; compact different http backends.
+;;
+;;  - Support both sync/async request
+;;  - Support streaming request
+;;  - Support retry for timeout
+;;  - Support config proxies for backends
+;;  - Support file upload/download (TODO)
+;;
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'url)
 (require 'eieio)
 
 (declare-function gt-log "ext:gt-core")
-(declare-function gt-single "ext:gt-core")
+(declare-function gt-single--eieio-childp "ext:gt-core")
+
+(unless (fboundp 'gt-single) ; suppress compiler error
+  (defclass gt-single () () :abstract t))
+
+(defun gt-format-params (data)
+  "Format DATA to k=v style query string.
+DATA should be list of (key . value)."
+  (if (or (null data) (stringp data)) data
+    (mapconcat (lambda (arg)
+                 (format "%s=%s"
+                         (url-hexify-string (format "%s" (car arg)))
+                         (url-hexify-string (format "%s" (or (cdr arg) 1)))))
+               (delq nil data) "&")))
 
 
 ;;; Http Client
 
 (defclass gt-http-client (gt-single)
   ((user-agent :initarg :user-agent :initform nil :type (or string null)))
-  "Used to send a request and get the response."
+  "Used to send http request."
   :abstract t)
 
 (defvar gt-http-client-max-retry 3)
@@ -48,58 +70,63 @@
 (defvar-local gt-http-client-stream-abort-flag nil
   "Non-nil means to ignore following stream progress in callback of http filter.")
 
-(cl-defgeneric gt-request (http-client &key url filter done fail data headers cache retry)
+(cl-defgeneric gt-request (http-client &rest _args &key url method headers data filter done fail sync retry &allow-other-keys)
   "Send HTTP request using the given HTTP-CLIENT.
 
 Optional keyword arguments:
   - URL: The URL to send the request to.
+  - METHOD: Request method. If nil guess by data.
+  - HEADERS: Additional headers to include in the request.
+  - DATA: The data to include in the request.
   - FILTER: A function to be called every time when some data returned.
   - DONE: A function to be called when the request succeeds.
   - FAIL: A function to be called when the request fails.
-  - DATA: The data to include in the request.
-  - HEADERS: Additional headers to include in the request.
-  - CACHE: enable get and set results in cache for current request.
   - RETRY: how many times it can retry for timeout
+  - SYNC: non-nil means request synchronized
 
-It should return the process of this request."
-  (:method :around ((client gt-http-client) &key url filter done fail data headers retry)
-           (cl-assert (and url (or filter done)))
-           (let* ((tag (eieio-object-class client))
-                  (failfn (lambda (status)
-                            ;; timeout and retry
-                            (unless retry (setq retry gt-http-client-max-retry))
-                            (if (and (string-match-p "Operation timeout" (format "%s" status)) (cl-plusp retry))
-                                (progn (gt-log tag (format "request timeout, retrying (remains %d times)..." retry))
-                                       (gt-request client
-                                                   :url url :filter filter :done done :fail fail
-                                                   :data data :headers headers :retry (1- retry)))
-                              ;; failed case
-                              (gt-log tag (format "Request FAIL: (%s) %s" url status))
-                              (if fail (funcall fail status)
-                                (signal (car status) (cdr status))))))
-                  (filterfn (when filter
-                              (lambda ()
-                                ;; abort action and error case
-                                (unless gt-http-client-stream-abort-flag
-                                  (condition-case err
-                                      (funcall filter)
-                                    (error
-                                     (setq gt-http-client-stream-abort-flag t)
-                                     (gt-log tag (format "Error in filter: (%s) %s" url err))
-                                     (funcall failfn err)))))))
-                  (donefn (lambda (raw)
-                            (gt-log tag (format "✓ %s" url))
-                            (when done (funcall done raw)))))
-             (gt-log tag
-               (format "> %s\n> %s" client url)
-               (if headers (format "> HEADER: %s" headers))
-               (if data (format "> DATA:   %s" data)))
-             (cl-call-next-method client :url url :headers headers :data data :filter filterfn :done donefn :fail failfn))))
+If request async, return the process behind the request."
+  (:method :around ((client gt-http-client) &rest args &key url method headers data filter done fail sync retry)
+           ;; normalize and validate
+           (if (and (null filter) (null done)) (setq sync t args `(:sync t ,@args)))
+           (cl-assert (and url (or (and sync (not filter)) (and (not sync) (or filter done)))))
+           (if (null method) (setq args `(:method ,(if data 'post 'get) ,@args)))
+           (if (listp data) (setq data (gt-format-params data) args `(:data ,data ,@args)))
+           ;; log
+           (gt-log (eieio-object-class client)
+             (format "> %s\n> %s" client url)
+             (if headers (format "> HEADER: %s" headers))
+             (if data (format "> DATA:   %s" data)))
+           ;; sync
+           (if sync (apply #'cl-call-next-method client args)
+             ;; async
+             (let* ((tag (eieio-object-class client))
+                    (failfn (lambda (status)
+                              ;; retry for timeout
+                              (unless retry (setq retry gt-http-client-max-retry))
+                              (if (and (string-match-p "Operation timeout" (format "%s" status)) (cl-plusp retry))
+                                  (progn (gt-log tag (format "request timeout, retrying (remains %d times)..." retry))
+                                         (apply #'gt-request client `(:retry ,(1- retry) ,@args)))
+                                ;; failed finally
+                                (gt-log tag (format "Request FAIL: (%s) %s" url status))
+                                (if fail (funcall fail status)
+                                  (signal (car status) (cdr status))))))
+                    (filterfn (when filter
+                                (lambda ()
+                                  ;; abort action and error case
+                                  (unless gt-http-client-stream-abort-flag
+                                    (condition-case err
+                                        (funcall filter)
+                                      (error
+                                       (setq gt-http-client-stream-abort-flag t)
+                                       (gt-log tag (format "Error in filter: (%s) %s" url err))
+                                       (funcall failfn err)))))))
+                    (donefn (lambda (raw)
+                              (gt-log tag (format "✓ %s" url))
+                              (when done (funcall done raw)))))
+               (apply #'cl-call-next-method client `(:fail ,failfn :filter ,filterfn :done ,donefn ,@args))))))
 
 
 ;; http client implemented using `url.el'
-
-(require 'url)
 
 (defclass gt-url-http-client (gt-http-client)
   ((proxy-services
@@ -124,39 +151,49 @@ It should return the process of this request."
         (narrow-to-region url-http-end-of-headers (point-max))
         (funcall gt-url-extra-filter)))))
 
-(cl-defmethod gt-request ((client gt-url-http-client) &key url filter done fail data headers retry)
+(cl-defmethod gt-request ((client gt-url-http-client) &key url method headers data filter done fail sync retry)
   (ignore retry)
   (let* ((inhibit-message t)
          (message-log-max nil)
          (url-user-agent (or (oref client user-agent) gt-user-agent))
          (url-proxy-services (or (oref client proxy-services) url-proxy-services))
          (url-request-extra-headers headers)
-         (url-request-method (if data "POST" "GET"))
+         (url-request-method (upcase (format "%s" method)))
          (url-request-data data)
-         (url-mime-encoding-string "identity")
-         (buf (url-retrieve
-               url (lambda (status)
-                     (let ((cb (current-buffer)))
-                       (set-buffer-multibyte t)
-                       (remove-hook 'after-change-functions #'gt-url-http-extra-filter t)
-                       (unwind-protect
-                           (if-let (err (or (cdr-safe (plist-get status :error))
-                                            (when (or (null url-http-end-of-headers) (= 1 (point-max)))
-                                              "Nothing responsed from server")))
-                               (if fail (funcall fail err)
-                                 (signal 'user-error err))
-                             (when done
-                               (funcall done (buffer-substring-no-properties url-http-end-of-headers (point-max)))))
-                         (kill-buffer cb))))
-               nil t)))
-    (when (and filter (buffer-live-p buf))
-      (with-current-buffer buf
-        (setq-local gt-url-extra-filter filter)
-        (add-hook 'after-change-functions #'gt-url-http-extra-filter nil t)))
-    (get-buffer-process buf)))
+         (url-mime-encoding-string "identity"))
+    ;; sync
+    (if sync
+        (condition-case err
+            (with-current-buffer (url-retrieve-synchronously url nil t)
+              (unwind-protect
+                  (let ((s (buffer-substring-no-properties url-http-end-of-headers (point-max))))
+                    (if done (funcall done s) s))
+                (kill-buffer (current-buffer))))
+          (error (if fail (funcall fail err) (signal 'user-error (cdr err)))))
+      ;; async
+      (let ((buf (url-retrieve url
+                               (lambda (status)
+                                 (let ((cb (current-buffer)))
+                                   (set-buffer-multibyte t)
+                                   (remove-hook 'after-change-functions #'gt-url-http-extra-filter t)
+                                   (unwind-protect
+                                       (if-let (err (or (cdr-safe (plist-get status :error))
+                                                        (when (or (null url-http-end-of-headers) (= 1 (point-max)))
+                                                          "Nothing responsed from server")))
+                                           (if fail (funcall fail err)
+                                             (signal 'user-error err))
+                                         (when done
+                                           (funcall done (buffer-substring-no-properties url-http-end-of-headers (point-max)))))
+                                     (kill-buffer cb))))
+                               nil t)))
+        (when (and filter (buffer-live-p buf))
+          (with-current-buffer buf
+            (setq-local gt-url-extra-filter filter)
+            (add-hook 'after-change-functions #'gt-url-http-extra-filter nil t)))
+        (get-buffer-process buf)))))
 
 
-;;; request with curl implements via package `plz'
+;;; request with curl implemented via package `plz.el'
 
 ;; you should install `plz' before use this
 
@@ -164,7 +201,8 @@ It should return the process of this request."
   ((extra-args
     :initarg :args
     :type list
-    :documentation "Extra arguments passed to curl programe.")))
+    :documentation "Extra arguments passed to curl programe."))
+  :documentation "Http Client implemented using `plz.el'.")
 
 (defvar plz-curl-program)
 (defvar plz-curl-default-args)
@@ -187,42 +225,47 @@ Or switch http client to `gt-url-http-client' instead:\n
   (unless (and (require 'plz nil t) (executable-find plz-curl-program))
     (error "You should have `plz.el' and `curl' installed before using `gt-plz-http-client'")))
 
-(cl-defmethod gt-request ((client gt-plz-http-client) &key url filter done fail data headers retry)
+(cl-defmethod gt-request ((client gt-plz-http-client) &key url method headers data filter done fail sync retry)
   (ignore retry)
   (let ((plz-curl-default-args
          (if (slot-boundp client 'extra-args)
              (append (oref client extra-args) plz-curl-default-args)
-           plz-curl-default-args)))
-    (plz (if data 'post 'get) url
-      :headers (cons `("User-Agent" . ,(or (oref client user-agent) gt-user-agent)) headers)
-      :body data
-      :as 'string
-      :filter (when filter
-                (lambda (proc string)
-                  (with-current-buffer (process-buffer proc)
-                    (save-excursion
-                      (goto-char (point-max))
-                      (insert string)
-                      (goto-char (point-min))
-                      (when (re-search-forward plz-http-end-of-headers-regexp nil t)
-                        (save-restriction
-                          (narrow-to-region (point) (point-max))
-                          (funcall filter)))))))
-      :then (lambda (raw)
-              (when done (funcall done raw)))
-      :else (lambda (err)
-              (let ((ret ;; try to compat with error object of url.el, see `url-retrieve' for details
-                     (or (plz-error-message err)
-                         (when-let (r (plz-error-curl-error err))
-                           (list 'curl-error
-                                 (concat (format "%s" (or (cdr r) (car r)))
-                                         (pcase (car r)
-                                           (2 (when (memq system-type '(cygwin windows-nt ms-dos))
-                                                gt-plz-initialize-error-message))))))
-                         (when-let (r (plz-error-response err))
-                           (list 'http (plz-response-status r) (plz-response-body r))))))
-                (if fail (funcall fail ret)
-                  (signal 'user-error ret)))))))
+           plz-curl-default-args))
+        (headers (cons `("User-Agent" . ,(or (oref client user-agent) gt-user-agent)) headers)))
+    ;; sync
+    (if sync
+        (condition-case err
+            (let ((r (plz method url :headers headers :body data :as 'string)))
+              (if done (funcall done r) r))
+          (error (if fail (funcall fail err) (signal 'user-error (cdr err)))))
+      ;; async
+      (plz method url :headers headers :body data :as 'string
+        :filter (when filter
+                  (lambda (proc string)
+                    (with-current-buffer (process-buffer proc)
+                      (save-excursion
+                        (goto-char (point-max))
+                        (insert string)
+                        (goto-char (point-min))
+                        (when (re-search-forward plz-http-end-of-headers-regexp nil t)
+                          (save-restriction
+                            (narrow-to-region (point) (point-max))
+                            (funcall filter)))))))
+        :then (lambda (raw)
+                (when done (funcall done raw)))
+        :else (lambda (err)
+                (let ((ret ;; try to compat with error object of url.el, see `url-retrieve' for details
+                       (or (plz-error-message err)
+                           (when-let (r (plz-error-curl-error err))
+                             (list 'curl-error
+                                   (concat (format "%s" (or (cdr r) (car r)))
+                                           (pcase (car r)
+                                             (2 (when (memq system-type '(cygwin windows-nt ms-dos))
+                                                  gt-plz-initialize-error-message))))))
+                           (when-let (r (plz-error-response err))
+                             (list 'http (plz-response-status r) (plz-response-body r))))))
+                  (if fail (funcall fail ret)
+                    (signal 'user-error ret))))))))
 
 (provide 'gt-httpx)
 
