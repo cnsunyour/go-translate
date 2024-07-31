@@ -110,11 +110,12 @@ Keyword arguments:
   - URL: The URL to send the request to.
   - METHOD: Request method, symbol like \\='post. If nil guess by data.
   - HEADERS: Additional headers to include in the request. Alist.
-  - DATA: The data to include in the request. If this is a string, it will be sent
-          directly as request body. If this is a list and every element is (key . value)
-          then this will be joined to a string like a=1&b=2 and then be sent. If this
-          is a list and some element is (key filename) format, then the list will be
-          normalized as multipart formdata string and be sent.
+  - DATA: The data to include in the request. If this is a string, it will be
+          sent directly as request body. If this is a list and every element
+          is (key . value) then this will be joined to a string like a=1&b=2 and
+          then be sent. If this is a list and some element is (key filename)
+          format, then the list will be normalized as multipart formdata string
+          and be sent.
   - FILTER: A function to be called every time when some data returned.
   - DONE: A function to be called when the request succeeds.
   - FAIL: A function to be called when the request fails.
@@ -274,29 +275,31 @@ Or switch http client to `gt-url-http-client' instead:\n
 
 (cl-defmethod gt-request ((client gt-plz-http-client) &key url method headers data filter done fail sync retry)
   (ignore retry)
-  (let ((plz-curl-default-args (if (slot-boundp client 'extra-args)
-                                   (append (oref client extra-args) plz-curl-default-args)
-                                 plz-curl-default-args))
-        (string-or-binary (lambda () ; decode according content-type. there is no builtin way to do this in plz
-                            (widen)
-                            (let* ((content-type (mail-fetch-field "content-type"))
-                                   (binaryp (gt-http-binary-p content-type)))
-                              (set-buffer-multibyte (not binaryp))
-                              (goto-char (point-min))
-                              (plz--narrow-to-body)
-                              (unless binaryp (decode-coding-region (point-min) (point-max) 'utf-8))
-                              (buffer-string))))
-        (headers `(("User-Agent" . ,(or (oref client user-agent) gt-user-agent)) ,@headers)))
-    (when (consp data)
-      (cl-loop for (key . value) in data
-               if (consp value) collect (cons key (car value)) into fs
-               else collect (cons key value) into ps
-               finally
-               (if (not fs)
-                   (setq data (gt-format-params data))
-                 ;; TODO: waiting for upstream
-                 ;; https://github.com/alphapapa/plz.el/pull/62
-                 (user-error "File upload not supported in current plz.el"))))
+  (let* ((plz-curl-default-args (if (slot-boundp client 'extra-args)
+                                    (append (oref client extra-args) plz-curl-default-args)
+                                  plz-curl-default-args))
+         (formdatap (and (consp data)
+                         (or (string-match-p "multipart/formdata"
+                                             (or (alist-get "Content-Type" headers nil nil #'string-equal-ignore-case) ""))
+                             (cl-some (lambda (x) (consp (cdr x))) data))))
+         (data (funcall (if (atom data) #'identity ; string
+                          (if formdatap #'gt-format-formdata #'gt-format-params)) ; alist
+                        data))
+         (string-or-binary (lambda () ; decode according content-type. there is no builtin way to do this in plz
+                             (widen)
+                             (let* ((content-type (mail-fetch-field "content-type"))
+                                    (binaryp (gt-http-binary-p content-type)))
+                               (set-buffer-multibyte (not binaryp))
+                               (goto-char (point-min))
+                               (plz--narrow-to-body)
+                               (unless binaryp (decode-coding-region (point-min) (point-max) 'utf-8))
+                               (buffer-string)))))
+    ;; headers
+    (when formdatap
+      (setf (alist-get "Content-Type" headers nil nil #'string-equal-ignore-case)
+            (concat "multipart/form-data; boundary=" gt-multipart-boundary)))
+    (unless (alist-get "User-Agent" headers nil nil #'string-equal-ignore-case)
+      (push `("User-Agent" . ,(or (oref client user-agent) gt-user-agent)) headers))
     ;; log
     (gt-log (eieio-object-class client)
       (format "> %s\n> %s" client url)
@@ -309,6 +312,7 @@ Or switch http client to `gt-url-http-client' instead:\n
             (let ((r (plz method url
                        :headers headers
                        :body data
+                       :body-type (if formdatap 'binary 'text)
                        :decode nil
                        :as string-or-binary
                        :then 'sync)))
@@ -319,6 +323,7 @@ Or switch http client to `gt-url-http-client' instead:\n
       (plz method url
         :headers headers
         :body data
+        :body-type (if formdatap 'binary 'text)
         :decode nil
         :as string-or-binary
         :filter (when filter
